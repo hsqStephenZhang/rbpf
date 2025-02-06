@@ -1424,6 +1424,17 @@ impl<'a> EbpfVmRaw<'a> {
         Ok(())
     }
 
+    #[cfg(all(not(windows), all(feature = "std", feature = "disassembler")))]
+    pub fn jit_disassemble(&self, detail: bool) -> Result<(), Error> {
+        match &self.parent.jit {
+            Some(jit) => jit.disassemble(detail),
+            None => Err(Error::new(
+                ErrorKind::Other,
+                "Error: program has not been JIT-compiled",
+            )),
+        }
+    }
+
     /// Execute the previously JIT-compiled program, with the given packet data, in a manner very
     /// similar to `execute_program()`.
     ///

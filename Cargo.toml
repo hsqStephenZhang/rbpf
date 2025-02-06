@@ -42,6 +42,8 @@ cranelift-jit = { version = "0.99", optional = true }
 cranelift-native = { version = "0.99", optional = true }
 cranelift-module = { version = "0.99", optional = true }
 
+capstone = { version = "0.13", optional = true }
+
 [dev-dependencies]
 
 elf = "0.0.10"
@@ -58,6 +60,7 @@ cranelift = [
     "dep:cranelift-native",
     "dep:cranelift-module",
 ]
+disassembler = ["capstone"]
 
 # Examples that depend on the standard library should be disabled when
 # testing the `no_std` configuration.
@@ -81,3 +84,7 @@ name = "rbpf_plugin"
 
 [[example]]
 name = "allowed_memory"
+
+[[example]]
+name = "demo"
+required-features = ["std", "cranelift", "disassembler"]
