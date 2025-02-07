@@ -42,10 +42,12 @@ cranelift-jit = { version = "0.99", optional = true }
 cranelift-native = { version = "0.99", optional = true }
 cranelift-module = { version = "0.99", optional = true }
 
+# Optional Dependencies for the LLVM JIT
+inkwell = { version = "0.5.0", features = ["llvm17-0"], optional = true }
+
 capstone = { version = "0.13", optional = true }
 
 [dev-dependencies]
-
 elf = "0.0.10"
 json = "0.11"
 hex = "0.4.3"
@@ -60,6 +62,7 @@ cranelift = [
     "dep:cranelift-native",
     "dep:cranelift-module",
 ]
+llvm = ["dep:inkwell"]
 disassembler = ["capstone"]
 
 # Examples that depend on the standard library should be disabled when
@@ -84,7 +87,3 @@ name = "rbpf_plugin"
 
 [[example]]
 name = "allowed_memory"
-
-[[example]]
-name = "demo"
-required-features = ["std", "cranelift", "disassembler"]

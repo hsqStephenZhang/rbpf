@@ -47,6 +47,8 @@ pub mod insn_builder;
 mod interpreter;
 #[cfg(all(not(windows), feature = "std"))]
 mod jit;
+#[cfg(feature = "llvm")]
+mod llvm_jit;
 #[cfg(not(feature = "std"))]
 mod no_std_error;
 mod verifier;
@@ -165,6 +167,8 @@ pub struct EbpfVmMbuff<'a> {
     jit: Option<jit::JitMemory<'a>>,
     #[cfg(feature = "cranelift")]
     cranelift_prog: Option<cranelift::CraneliftProgram>,
+    #[cfg(feature = "llvm")]
+    llvm_prog: Option<llvm_jit::LLVMProgram>,
     helpers: HashMap<u32, ebpf::Helper>,
     allowed_memory: HashSet<u64>,
 }
@@ -197,6 +201,8 @@ impl<'a> EbpfVmMbuff<'a> {
             jit: None,
             #[cfg(feature = "cranelift")]
             cranelift_prog: None,
+            #[cfg(feature = "llvm")]
+            llvm_prog: None,
             helpers: HashMap::new(),
             allowed_memory: HashSet::new(),
         })
@@ -606,6 +612,35 @@ impl<'a> EbpfVmMbuff<'a> {
             None => Err(Error::new(
                 ErrorKind::Other,
                 "Error: program has not been compiled with cranelift",
+            )),
+        }
+    }
+
+    #[cfg(feature = "llvm")]
+    pub fn execute_program_llvm(&self, mem: &mut [u8], mbuff: &'a mut [u8]) -> Result<u64, Error> {
+        // If packet data is empty, do not send the address of an empty slice; send a null pointer
+        //  as first argument instead, as this is uBPF's behavior (empty packet should not happen
+        //  in the kernel; anyway the verifier would prevent the use of uninitialized registers).
+        //  See `mul_loop` test.
+        let mem_ptr = match mem.len() {
+            0 => ptr::null_mut(),
+            _ => mem.as_ptr() as *mut u8,
+        };
+
+        // The last two arguments are not used in this function. They would be used if there was a
+        // need to indicate to the JIT at which offset in the mbuff mem_ptr and mem_ptr + mem.len()
+        // should be stored; this is what happens with struct EbpfVmFixedMbuff.
+        match &self.llvm_prog {
+            Some(prog) => Ok(prog.execute(
+                &self.helpers,
+                mem_ptr,
+                mem.len() as _,
+                mbuff.as_ptr() as *mut u8,
+                mbuff.len() as _,
+            )),
+            None => Err(Error::new(
+                ErrorKind::Other,
+                "Error: program has not been compiled with llvm",
             )),
         }
     }
@@ -1545,6 +1580,36 @@ impl<'a> EbpfVmRaw<'a> {
         let mut mbuff = vec![];
         self.parent.execute_program_cranelift(mem, &mut mbuff)
     }
+
+    #[cfg(feature = "llvm")]
+    pub fn llvm_compile(&mut self) -> Result<(), Error> {
+        let mut program = llvm_jit::LLVMProgram::new(self.parent.helpers.clone());
+        let prog = match self.parent.prog {
+            Some(prog) => prog,
+            None => Err(Error::new(
+                ErrorKind::Other,
+                "Error: No program set, call prog_set() to load one",
+            ))?,
+        };
+
+        program.compile_function(prog)?;
+
+        self.parent.llvm_prog = Some(program);
+        Ok(())
+    }
+
+    #[cfg(feature = "llvm")]
+    pub fn execute_program_llvm(&self, mem: &'a mut [u8]) -> Result<u64, Error> {
+        let mut mbuff = vec![];
+        self.parent.execute_program_llvm(mem, &mut mbuff)
+    }
+
+    #[cfg(feature = "llvm")]
+    pub fn llvm_print_ir(&self) {
+        if let Some(prog) = &self.parent.llvm_prog {
+            prog.print_ir();
+        }
+    }
 }
 
 /// A virtual machine to run eBPF program. This kind of VM is used for programs that do not work
@@ -1859,6 +1924,11 @@ impl<'a> EbpfVmNoData<'a> {
         self.parent.cranelift_compile()
     }
 
+    #[cfg(feature = "llvm")]
+    pub fn llvm_compile(&mut self) -> Result<(), Error> {
+        self.parent.llvm_compile()
+    }
+
     /// Execute the previously JIT-compiled program, without providing pointers to any memory area
     /// whatsoever, in a manner very similar to `execute_program()`.
     ///
@@ -1881,5 +1951,15 @@ impl<'a> EbpfVmNoData<'a> {
     #[cfg(feature = "cranelift")]
     pub fn execute_program_cranelift(&self) -> Result<u64, Error> {
         self.parent.execute_program_cranelift(&mut [])
+    }
+
+    #[cfg(feature = "llvm")]
+    pub fn execute_program_llvm(&self) -> Result<u64, Error> {
+        self.parent.execute_program_llvm(&mut [])
+    }
+
+    #[cfg(feature = "llvm")]
+    pub fn llvm_print_ir(&self) {
+        self.parent.llvm_print_ir();
     }
 }
