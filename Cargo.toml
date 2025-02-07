@@ -49,6 +49,7 @@ capstone = { version = "0.13", optional = true }
 elf = "0.0.10"
 json = "0.11"
 hex = "0.4.3"
+inkwell = { version = "0.5.0", features = ["llvm17-0"] }
 
 [features]
 default = ["std"]
@@ -86,5 +87,4 @@ name = "rbpf_plugin"
 name = "allowed_memory"
 
 [[example]]
-name = "demo"
-required-features = ["std", "cranelift", "disassembler"]
+name = "llvm_jit"
