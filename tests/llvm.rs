@@ -485,6 +485,56 @@ fn test_llvm_err_stack_out_of_bound() {
 }
 
 test_llvm!(
+    test_llvm_stack,
+    "
+    mov r1, 51
+    stdw [r10-16], 0xab
+    stdw [r10-8], 0xcd
+    and r1, 1
+    lsh r1, 3
+    mov r2, r10
+    add r2, r1
+    ldxdw r0, [r2-16]
+    exit
+    ",
+    0xcd
+);
+
+
+#[test]
+fn test_llvm_stack2() {
+    // after call 1, r0 is 0
+    // after call 0, r0 is 0x2b28292e
+    let prog = assemble(
+        "
+        stb [r10-8], 0x01
+        stb [r10-7], 0x02
+        stb [r10-6], 0x03
+        stb [r10-5], 0x04
+        mov r1, r10
+        mov r2, 0x8
+        sub r1, r2
+        call 1
+        mov r1, 0
+        ldxb r2, [r10-8]
+        ldxb r3, [r10-7]
+        ldxb r4, [r10-6]
+        ldxb r5, [r10-5]
+        call 0
+        xor r0, 0x2a2a2a2a
+        exit",
+    )
+    .unwrap();
+
+    let mut vm = rbpf::EbpfVmNoData::new(Some(&prog)).unwrap();
+    vm.register_helper(0, helpers::gather_bytes).unwrap();
+    vm.register_helper(1, helpers::memfrob).unwrap();
+    vm.llvm_compile().unwrap();
+    vm.llvm_print_ir();
+    assert_eq!(vm.execute_program_llvm().unwrap(), 0x01020304);
+}
+
+test_llvm!(
     test_llvm_exit,
     "
     mov r0, 0
@@ -1736,52 +1786,6 @@ test_llvm!(
     ",
     0x1
 );
-
-// test_llvm!(
-//     test_llvm_stack,
-//     "
-//     mov r1, 51
-//     stdw [r10-16], 0xab
-//     stdw [r10-8], 0xcd
-//     and r1, 1
-//     lsh r1, 3
-//     mov r2, r10
-//     add r2, r1
-//     ldxdw r0, [r2-16]
-//     exit
-//     ",
-//     0xcd
-// );
-
-// #[test]
-// fn test_llvm_stack2() {
-//     let prog = assemble(
-//         "
-//         stb [r10-4], 0x01
-//         stb [r10-3], 0x02
-//         stb [r10-2], 0x03
-//         stb [r10-1], 0x04
-//         mov r1, r10
-//         mov r2, 0x4
-//         sub r1, r2
-//         call 1
-//         mov r1, 0
-//         ldxb r2, [r10-4]
-//         ldxb r3, [r10-3]
-//         ldxb r4, [r10-2]
-//         ldxb r5, [r10-1]
-//         call 0
-//         xor r0, 0x2a2a2a2a
-//         exit",
-//     )
-//     .unwrap();
-
-//     let mut vm = rbpf::EbpfVmNoData::new(Some(&prog)).unwrap();
-//     vm.register_helper(0, helpers::gather_bytes).unwrap();
-//     vm.register_helper(1, helpers::memfrob).unwrap();
-//     vm.llvm_compile().unwrap();
-//     assert_eq!(vm.execute_program_llvm().unwrap(), 0x01020304);
-// }
 
 test_llvm!(
     test_llvm_stb,

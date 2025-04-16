@@ -11,7 +11,7 @@ use inkwell::llvm_sys::core::LLVMContextCreate;
 use inkwell::module::Module;
 use inkwell::targets::ByteOrdering;
 use inkwell::types::IntType;
-use inkwell::values::{FunctionValue, IntValue, PointerValue};
+use inkwell::values::{BasicValue, FunctionValue, IntValue, PointerValue};
 use inkwell::{AddressSpace, IntPredicate, OptimizationLevel};
 
 use crate::ebpf::{
@@ -38,6 +38,8 @@ pub struct LLVMProgram {
     byte_ordering: ByteOrdering,
     intrinsics: [FunctionValue<'static>; 3],
     entry_block: BasicBlock<'static>,
+    stack_start_addr: IntValue<'static>,
+    stack_end_addr: IntValue<'static>,
 }
 
 impl LLVMProgram {
@@ -143,15 +145,59 @@ impl LLVMProgram {
             .build_int_add(umem_start, umem_len, "umem_end")
             .unwrap();
 
+        const STACK_SIZE: usize = 512;
+        let stack_array_type = context.i8_type().array_type(STACK_SIZE as u32);
+        let stack_slot_ptr = builder
+            .build_alloca(stack_array_type, "stack_slot")
+            .unwrap();
+        let int_zero = context.i64_type().const_zero(); // Index type should match pointer size potentially
+        let stack_start_ptr = unsafe {
+            builder
+                .build_gep(
+                    stack_array_type, // GEP needs the type of the value being pointed to by stack_slot_ptr
+                    stack_slot_ptr,
+                    &[int_zero, int_zero], // Indices: [0] selects the array itself, [0] selects the first element
+                    "stack_start_ptr",
+                )
+                .unwrap()
+        };
+        let stack_start_addr = builder
+            .build_ptr_to_int(stack_start_ptr, context.i64_type(), "stack_start_addr")
+            .unwrap();
+
+        let stack_size_val = context.i64_type().const_int(STACK_SIZE as _, false);
+        let stack_end_addr = builder
+            .build_int_add(
+                stack_start_addr,
+                stack_size_val,
+                "stack_end_addr", // This corresponds to cranelift's stack_addr(..., ss, STACK_SIZE)
+            )
+            .unwrap();
+
         // Initialize other registers to 0
         let zero = context.i64_type().const_int(0, false);
         for i in 0..=10 {
-            builder.build_store(registers[i].unwrap(), zero).unwrap();
+            builder
+                .build_store(registers[i].unwrap(), zero)
+                .unwrap()
+                .set_alignment(8)
+                .unwrap();
         }
         builder
             .build_store(registers[1].unwrap(), mem_start)
+            .unwrap()
+            .set_alignment(8)
             .unwrap();
-        builder.build_store(registers[2].unwrap(), mem_end).unwrap();
+        builder
+            .build_store(registers[2].unwrap(), mem_end)
+            .unwrap()
+            .set_alignment(8)
+            .unwrap();
+        builder
+            .build_store(registers[10].unwrap(), stack_end_addr)
+            .unwrap()
+            .set_alignment(8)
+            .unwrap();
 
         LLVMProgram {
             context_ptr: context_ptr as *const Context,
@@ -169,6 +215,8 @@ impl LLVMProgram {
             byte_ordering,
             intrinsics: [bswap16_intrinsic, bswap32_intrinsic, bswap64_intrinsic],
             entry_block,
+            stack_start_addr,
+            stack_end_addr,
         }
     }
 
@@ -223,18 +271,17 @@ impl LLVMProgram {
                         _ => unreachable!(),
                     };
 
-                    let mem_start = self.mem_start;
-                    let offset = ctx
-                        .i64_type()
-                        .const_int(insn.off as u64, false)
-                        .const_to_pointer(ctx.ptr_type(AddressSpace::default()));
+                    let mem_start = self.mem_start.as_basic_value_enum().into_int_value();
+                    let offset = ctx.i64_type().const_int(insn.off as u64, false);
                     let addr = builder.build_int_add(mem_start, offset, "addr").unwrap();
 
                     // IND instructions additionally add the value of the source register
                     let is_ind = (insn.opc & BPF_IND) != 0;
                     let addr = if is_ind {
                         let src_reg = self.insn_src(&insn);
-                        unsafe { addr.const_gep(ty, &[src_reg]) }
+                        builder
+                            .build_int_add(addr, src_reg, "ind_addr_with)_src")
+                            .unwrap()
                     } else {
                         addr
                     };
@@ -269,9 +316,7 @@ impl LLVMProgram {
                         _ => unreachable!(),
                     };
 
-                    let base = self
-                        .insn_src(&insn)
-                        .const_to_pointer(ctx.ptr_type(AddressSpace::default()));
+                    let base = self.insn_src(&insn);
                     let loaded = self.reg_load(ty, base, insn.off);
 
                     let ext = if ty != ctx.i64_type() {
@@ -318,9 +363,7 @@ impl LLVMProgram {
                         value
                     };
 
-                    let base = self
-                        .insn_dst(&insn)
-                        .const_to_pointer(ctx.ptr_type(AddressSpace::default()));
+                    let base = self.insn_dst(&insn);
                     self.reg_store(ty, base, insn.off, narrow);
                 }
 
@@ -913,6 +956,7 @@ impl LLVMProgram {
                         .builder
                         .build_load(ctx.i64_type(), self.registers[0], "ret_val")
                         .unwrap();
+                    r0.as_instruction_value().unwrap().set_alignment(8).unwrap();
                     self.builder.build_return(Some(&r0)).unwrap();
                     prev_is_terminator = true;
                 }
@@ -926,35 +970,41 @@ impl LLVMProgram {
                         )
                     })?;
 
-                    macro_rules! arg {
-                        ($i:expr) => {
-                            self.builder
-                                .build_load(
-                                    ctx.i64_type(),
-                                    self.registers[$i],
-                                    &format!("arg{}", $i),
-                                )
-                                .unwrap()
-                        };
-                        () => {};
-                    }
+                    let arg = |i: usize| {
+                        let inst = self
+                            .builder
+                            .build_load(ctx.i64_type(), self.registers[i], &format!("arg{}", i))
+                            .unwrap();
+                        inst.as_instruction_value()
+                            .unwrap()
+                            .set_alignment(8)
+                            .unwrap();
+                        inst
+                    };
 
                     let args = [
-                        arg!(1).into(),
-                        arg!(2).into(),
-                        arg!(3).into(),
-                        arg!(4).into(),
-                        arg!(5).into(),
+                        arg(1).into(),
+                        arg(2).into(),
+                        arg(3).into(),
+                        arg(4).into(),
+                        arg(5).into(),
                     ];
 
                     let res = self
                         .builder
                         .build_call(func, &args, &format!("call_{}", k))
                         .unwrap();
-                    self.set_dst(
-                        &insn,
-                        res.try_as_basic_value().left().unwrap().into_int_value(),
-                    );
+
+                    // store to R0 according to eBPF ABI
+                    // TODO: does llvm provide an interface for the reg to store the return value?
+                    let inst = self
+                        .builder
+                        .build_store(
+                            self.registers[0],
+                            res.try_as_basic_value().left().unwrap().into_int_value(),
+                        )
+                        .unwrap();
+                    inst.set_alignment(8).unwrap();
                 }
                 _ => unimplemented!("inst: {:?}", insn),
             }
@@ -963,7 +1013,7 @@ impl LLVMProgram {
         Ok(())
     }
 
-    fn reg_load<'b>(&self, ty: IntType<'b>, base: PointerValue<'b>, offset: i16) -> IntValue<'b>
+    fn reg_load<'b>(&self, ty: IntType<'b>, base: IntValue<'b>, offset: i16) -> IntValue<'b>
     where
         'static: 'b,
     {
@@ -972,14 +1022,20 @@ impl LLVMProgram {
         if offset == 0 {
             return self
                 .builder
-                .build_load(ty, base, "loaded")
+                .build_load(
+                    ty,
+                    base.const_to_pointer(self.context().ptr_type(AddressSpace::default())),
+                    "loaded",
+                )
                 .unwrap()
                 .into_int_value();
         } else {
-            let offset = ty
-                .const_int(offset as u64, false)
-                .const_to_pointer(self.context().ptr_type(AddressSpace::default()));
-            let addr = self.builder.build_int_add(base, offset, "addr").unwrap();
+            let offset = ty.const_int(offset as u64, false);
+            let addr = self
+                .builder
+                .build_int_add(base, offset, "addr_with_addr")
+                .unwrap();
+            let addr = addr.const_to_pointer(self.context().ptr_type(AddressSpace::default()));
             self.builder
                 .build_load(ty, addr, "loaded")
                 .unwrap()
@@ -987,31 +1043,49 @@ impl LLVMProgram {
         }
     }
 
-    fn reg_store(&self, ty: IntType<'_>, base: PointerValue<'_>, offset: i16, val: IntValue<'_>) {
+    // TODO: signed or unsigned extend?
+    fn reg_store(&self, ty: IntType<'_>, base: IntValue<'_>, offset: i16, val: IntValue<'_>) {
         if offset == 0 {
-            self.builder.build_store(base, val).unwrap();
+            self.builder
+                .build_store(
+                    base.const_to_pointer(self.context().ptr_type(AddressSpace::default())),
+                    val,
+                )
+                .unwrap();
         } else {
-            let offset = ty
-                .const_int(offset as u64, false)
-                .const_to_pointer(self.context().ptr_type(AddressSpace::default()));
+            let offset = ty.const_int(offset as u64, false);
             let addr = self.builder.build_int_add(base, offset, "addr").unwrap();
-            self.builder.build_store(addr, val).unwrap();
+            let inst = self
+                .builder
+                .build_store(
+                    addr.const_to_pointer(self.context().ptr_type(AddressSpace::default())),
+                    val,
+                )
+                .unwrap();
+            inst.set_alignment(8).unwrap();
         }
     }
 
     fn insn_imm(&self, insn: &Insn) -> IntValue<'_> {
         self.context().i64_type().const_int(insn.imm as u64, false)
     }
+
     fn insn_imm32(&self, insn: &Insn) -> IntValue<'_> {
         self.context().i32_type().const_int(insn.imm as u64, false)
     }
 
     fn insn_dst(&self, insn: &Insn) -> IntValue<'_> {
         let dst = self.registers[insn.dst as usize];
-        self.builder
+        let load = self
+            .builder
             .build_load(self.context().i64_type(), dst, "dst_val")
+            .unwrap();
+        load.as_instruction_value()
             .unwrap()
-            .into_int_value()
+            .set_alignment(8)
+            .unwrap();
+        let dst_val = load.into_int_value();
+        dst_val
     }
 
     fn insn_dst32(&self, insn: &Insn) -> IntValue<'_> {
@@ -1032,11 +1106,17 @@ impl LLVMProgram {
 
     fn insn_src(&self, insn: &Insn) -> IntValue<'_> {
         let src = self.registers[insn.src as usize];
-        self.builder
+        let inst = self
+            .builder
             .build_load(self.context().i64_type(), src, "src_val")
+            .unwrap();
+        inst.as_instruction_value()
             .unwrap()
-            .into_int_value()
+            .set_alignment(8)
+            .unwrap();
+        inst.into_int_value()
     }
+
     fn insn_src32(&self, insn: &Insn) -> IntValue<'_> {
         let src = self.registers[insn.src as usize];
         self.builder
@@ -1047,7 +1127,8 @@ impl LLVMProgram {
 
     fn set_dst(&self, insn: &Insn, val: IntValue<'_>) {
         let dst = self.registers[insn.dst as usize];
-        self.builder.build_store(dst, val).unwrap();
+        let inst = self.builder.build_store(dst, val).unwrap();
+        inst.set_alignment(8).unwrap();
     }
 
     fn set_dst_masked(&self, insn: &Insn, val: IntValue<'_>, mask: u64) {
