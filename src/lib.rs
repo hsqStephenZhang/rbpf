@@ -48,7 +48,7 @@ mod interpreter;
 #[cfg(all(not(windows), feature = "std"))]
 mod jit;
 #[cfg(feature = "llvm")]
-mod llvm_jit;
+mod llvm;
 #[cfg(not(feature = "std"))]
 mod no_std_error;
 mod verifier;
@@ -168,7 +168,7 @@ pub struct EbpfVmMbuff<'a> {
     #[cfg(feature = "cranelift")]
     cranelift_prog: Option<cranelift::CraneliftProgram>,
     #[cfg(feature = "llvm")]
-    llvm_prog: Option<llvm_jit::LLVMProgram>,
+    llvm_prog: Option<llvm::LLVMProgram>,
     helpers: HashMap<u32, ebpf::Helper>,
     allowed_memory: HashSet<u64>,
 }
@@ -1583,7 +1583,7 @@ impl<'a> EbpfVmRaw<'a> {
 
     #[cfg(feature = "llvm")]
     pub fn llvm_compile(&mut self) -> Result<(), Error> {
-        let mut program = llvm_jit::LLVMProgram::new(self.parent.helpers.clone());
+        let mut program = llvm::LLVMProgram::new(self.parent.helpers.clone());
         let prog = match self.parent.prog {
             Some(prog) => prog,
             None => Err(Error::new(
