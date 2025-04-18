@@ -1,13 +1,14 @@
 use core::mem::ManuallyDrop;
 use std::collections::{BTreeMap, HashMap};
 use std::io::Error;
+use std::path::Path;
 use std::ptr;
 use std::sync::atomic::AtomicUsize;
 
 use inkwell::basic_block::BasicBlock;
 use inkwell::builder::Builder;
 use inkwell::context::Context;
-use inkwell::llvm_sys::core::LLVMContextCreate;
+use inkwell::memory_buffer::MemoryBuffer;
 use inkwell::module::Module;
 use inkwell::targets::ByteOrdering;
 use inkwell::types::IntType;
@@ -22,40 +23,28 @@ use crate::ebpf::{
 const PROG_NAME: &str = "main";
 
 #[allow(unused)]
-pub struct LLVMProgram {
-    context_ptr: *const Context,
-    module: ManuallyDrop<Module<'static>>,
-    builder: Builder<'static>,
-    function: FunctionValue<'static>,
-    helpers: HashMap<u32, FunctionValue<'static>>,
-    registers: [PointerValue<'static>; 11], // R0-R10
-    insn_blocks: BTreeMap<u32, BasicBlock<'static>>,
-    insn_targets: BTreeMap<u32, (BasicBlock<'static>, BasicBlock<'static>)>,
-    mem_start: PointerValue<'static>,
-    mem_end: PointerValue<'static>,
-    umem_start: PointerValue<'static>,
-    umem_end: PointerValue<'static>,
+pub struct LLVMCompiler<'ctx> {
+    context: &'ctx Context,
+    module: ManuallyDrop<Module<'ctx>>,
+    builder: Builder<'ctx>,
+    function: FunctionValue<'ctx>,
+    helpers: HashMap<u32, FunctionValue<'ctx>>,
+    registers: [PointerValue<'ctx>; 11], // R0-R10
+    insn_blocks: BTreeMap<u32, BasicBlock<'ctx>>,
+    insn_targets: BTreeMap<u32, (BasicBlock<'ctx>, BasicBlock<'ctx>)>,
+    mem_start: PointerValue<'ctx>,
+    mem_end: PointerValue<'ctx>,
+    umem_start: PointerValue<'ctx>,
+    umem_end: PointerValue<'ctx>,
     byte_ordering: ByteOrdering,
-    intrinsics: [FunctionValue<'static>; 3],
-    entry_block: BasicBlock<'static>,
-    stack_start_addr: IntValue<'static>,
-    stack_end_addr: IntValue<'static>,
+    intrinsics: [FunctionValue<'ctx>; 3],
+    entry_block: BasicBlock<'ctx>,
+    stack_start_addr: IntValue<'ctx>,
+    stack_end_addr: IntValue<'ctx>,
 }
 
-impl LLVMProgram {
-    fn context(&self) -> &'static Context {
-        // SAFETY: we hold the raw context until the drop of this struct
-        unsafe { &*(self.context_ptr as *const Context) }
-    }
-
-    pub fn new(helpers: HashMap<u32, ebpf::Helper>) -> Self {
-        let context_ref = unsafe { LLVMContextCreate() };
-
-        // SAFETY: we hold the raw context until the drop of this struct
-        let context_ptr = Box::leak(Box::new(unsafe { Context::new(context_ref) }));
-        let context: &'static Context = unsafe { &*(context_ptr as *const Context) };
-        // let context = context.raw()
-
+impl<'ctx> LLVMCompiler<'ctx> {
+    pub fn new(helpers: HashMap<u32, ebpf::Helper>, context: &'ctx Context) -> Self {
         // let context = unsafe { ManuallyDrop::new() };
         let module: Module<'_> = context.create_module("ebpf_module");
         let byte_ordering = {
@@ -199,8 +188,8 @@ impl LLVMProgram {
             .set_alignment(8)
             .unwrap();
 
-        LLVMProgram {
-            context_ptr: context_ptr as *const Context,
+        LLVMCompiler {
+            context,
             module: ManuallyDrop::new(module),
             builder,
             helpers,
@@ -220,13 +209,12 @@ impl LLVMProgram {
         }
     }
 
-    pub fn compile_function(&mut self, prog: &[u8]) -> Result<(), Error> {
-        let ctx = self.context();
+    pub fn compile_function(&mut self, prog: &[u8]) -> Result<Vec<u8>, Error> {
         build_cfg(
+            self.context,
             &mut self.insn_blocks,
             &mut self.insn_targets,
             prog,
-            ctx,
             self.function,
             AtomicUsize::new(0),
         )?;
@@ -234,8 +222,8 @@ impl LLVMProgram {
         self.translate_program(prog)
     }
 
-    fn translate_program(&mut self, prog: &[u8]) -> Result<(), Error> {
-        let ctx = self.context();
+    fn translate_program(&mut self, prog: &[u8]) -> Result<Vec<u8>, Error> {
+        let ctx = self.context;
         let builder = &self.builder;
 
         let mut insn_ptr: usize = 0;
@@ -286,8 +274,13 @@ impl LLVMProgram {
                         addr
                     };
 
-                    let loaded = self.reg_load(ty, addr, 0);
-
+                    let addr =
+                        addr.const_to_pointer(self.context.ptr_type(AddressSpace::default()));
+                    let loaded = self
+                        .builder
+                        .build_load(ty, addr, "loaded")
+                        .unwrap()
+                        .into_int_value();
                     let ext = if ty != ctx.i64_type() {
                         builder
                             .build_int_z_extend(loaded, ctx.i64_type(), "ext")
@@ -317,7 +310,19 @@ impl LLVMProgram {
                     };
 
                     let base = self.insn_src(&insn);
-                    let loaded = self.reg_load(ty, base, insn.off);
+                    let offset = ty.const_int(insn.off as u64, false);
+                    let addr = self
+                        .builder
+                        .build_int_add(base, offset, "addr_with_addr")
+                        .unwrap();
+                    let addr =
+                        addr.const_to_pointer(self.context.ptr_type(AddressSpace::default()));
+                    let loaded = self
+                        .builder
+                        .build_load(ty, addr, "loaded")
+                        .unwrap()
+                        .into_int_value();
+                    // let loaded = self.reg_load(ty, base, insn.off);
 
                     let ext = if ty != ctx.i64_type() {
                         builder
@@ -1010,12 +1015,18 @@ impl LLVMProgram {
             }
             insn_ptr += 1;
         }
-        Ok(())
+        self.module.write_bitcode_to_path(Path::new("/tmp/a.bc"));
+        let bc = self.module.write_bitcode_to_memory().as_slice().to_vec();
+        {
+            let membuf = MemoryBuffer::create_from_memory_range(&bc, "t");
+            let m = Module::parse_bitcode_from_buffer(&membuf, ctx).unwrap();
+        }
+        Ok(bc)
     }
 
-    fn reg_load<'b>(&self, ty: IntType<'b>, base: IntValue<'b>, offset: i16) -> IntValue<'b>
+    fn reg_load<'b>(&'b self, ty: IntType<'b>, base: IntValue<'b>, offset: i16) -> IntValue<'b>
     where
-        'static: 'b,
+        'b: 'ctx,
     {
         // self.insert_bounds_check(bcx, ty, base, offset);
         // bcx.ins().load(ty, MemFlags::new(), base, offset as i32)
@@ -1024,7 +1035,7 @@ impl LLVMProgram {
                 .builder
                 .build_load(
                     ty,
-                    base.const_to_pointer(self.context().ptr_type(AddressSpace::default())),
+                    base.const_to_pointer(self.context.ptr_type(AddressSpace::default())),
                     "loaded",
                 )
                 .unwrap()
@@ -1035,7 +1046,7 @@ impl LLVMProgram {
                 .builder
                 .build_int_add(base, offset, "addr_with_addr")
                 .unwrap();
-            let addr = addr.const_to_pointer(self.context().ptr_type(AddressSpace::default()));
+            let addr = addr.const_to_pointer(self.context.ptr_type(AddressSpace::default()));
             self.builder
                 .build_load(ty, addr, "loaded")
                 .unwrap()
@@ -1048,7 +1059,7 @@ impl LLVMProgram {
         if offset == 0 {
             self.builder
                 .build_store(
-                    base.const_to_pointer(self.context().ptr_type(AddressSpace::default())),
+                    base.const_to_pointer(self.context.ptr_type(AddressSpace::default())),
                     val,
                 )
                 .unwrap();
@@ -1058,7 +1069,7 @@ impl LLVMProgram {
             let inst = self
                 .builder
                 .build_store(
-                    addr.const_to_pointer(self.context().ptr_type(AddressSpace::default())),
+                    addr.const_to_pointer(self.context.ptr_type(AddressSpace::default())),
                     val,
                 )
                 .unwrap();
@@ -1067,18 +1078,18 @@ impl LLVMProgram {
     }
 
     fn insn_imm(&self, insn: &Insn) -> IntValue<'_> {
-        self.context().i64_type().const_int(insn.imm as u64, false)
+        self.context.i64_type().const_int(insn.imm as u64, false)
     }
 
     fn insn_imm32(&self, insn: &Insn) -> IntValue<'_> {
-        self.context().i32_type().const_int(insn.imm as u64, false)
+        self.context.i32_type().const_int(insn.imm as u64, false)
     }
 
     fn insn_dst(&self, insn: &Insn) -> IntValue<'_> {
         let dst = self.registers[insn.dst as usize];
         let load = self
             .builder
-            .build_load(self.context().i64_type(), dst, "dst_val")
+            .build_load(self.context.i64_type(), dst, "dst_val")
             .unwrap();
         load.as_instruction_value()
             .unwrap()
@@ -1091,7 +1102,7 @@ impl LLVMProgram {
     fn insn_dst32(&self, insn: &Insn) -> IntValue<'_> {
         let dst = self.registers[insn.dst as usize];
         self.builder
-            .build_load(self.context().i32_type(), dst, "dst_val")
+            .build_load(self.context.i32_type(), dst, "dst_val")
             .unwrap()
             .into_int_value()
     }
@@ -1099,7 +1110,7 @@ impl LLVMProgram {
     fn insn_dst16(&self, insn: &Insn) -> IntValue<'_> {
         let dst = self.registers[insn.dst as usize];
         self.builder
-            .build_load(self.context().i16_type(), dst, "dst_val")
+            .build_load(self.context.i16_type(), dst, "dst_val")
             .unwrap()
             .into_int_value()
     }
@@ -1108,7 +1119,7 @@ impl LLVMProgram {
         let src = self.registers[insn.src as usize];
         let inst = self
             .builder
-            .build_load(self.context().i64_type(), src, "src_val")
+            .build_load(self.context.i64_type(), src, "src_val")
             .unwrap();
         inst.as_instruction_value()
             .unwrap()
@@ -1120,7 +1131,7 @@ impl LLVMProgram {
     fn insn_src32(&self, insn: &Insn) -> IntValue<'_> {
         let src = self.registers[insn.src as usize];
         self.builder
-            .build_load(self.context().i32_type(), src, "src_val")
+            .build_load(self.context.i32_type(), src, "src_val")
             .unwrap()
             .into_int_value()
     }
@@ -1133,10 +1144,10 @@ impl LLVMProgram {
 
     fn set_dst_masked(&self, insn: &Insn, val: IntValue<'_>, mask: u64) {
         let dst = self.registers[insn.dst as usize];
-        let mask = self.context().i64_type().const_int(mask, false);
+        let mask = self.context.i64_type().const_int(mask, false);
         let val = self
             .builder
-            .build_int_z_extend(val, self.context().i64_type(), "val")
+            .build_int_z_extend(val, self.context.i64_type(), "val")
             .unwrap();
         let masked_val = self.builder.build_and(val, mask, "masked_val").unwrap();
         self.builder.build_store(dst, masked_val).unwrap();
@@ -1148,13 +1159,13 @@ impl LLVMProgram {
             .builder
             .build_and(
                 val,
-                self.context().i64_type().const_int(0xffffffff, false),
+                self.context.i64_type().const_int(0xffffffff, false),
                 "val32",
             )
             .unwrap();
         let val32 = self
             .builder
-            .build_int_z_extend(val32, self.context().i64_type(), "val32_z_ext")
+            .build_int_z_extend(val32, self.context.i64_type(), "val32_z_ext")
             .unwrap();
 
         self.builder.build_store(dst, val32).unwrap();
@@ -1189,18 +1200,6 @@ impl LLVMProgram {
     }
 }
 
-impl Drop for LLVMProgram {
-    fn drop(&mut self) {
-        if !self.context_ptr.is_null() {
-            unsafe {
-                ManuallyDrop::drop(&mut self.module);
-                let _ctx = Box::from_raw(self.context_ptr as *mut Context);
-                self.context_ptr = ptr::null();
-            }
-        }
-    }
-}
-
 fn gen_next_label(label_cnt: &AtomicUsize) -> String {
     let cnt = label_cnt.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     format!("block_{}", cnt)
@@ -1211,12 +1210,12 @@ fn gen_next_label(label_cnt: &AtomicUsize) -> String {
 /// We do this because cranelift does not allow us to switch back to a previously
 /// filled block and add instructions to it. So we can't split the program as we
 /// translate it.
-fn build_cfg(
-    insn_blocks: &mut BTreeMap<u32, BasicBlock<'static>>,
-    insn_targets: &mut BTreeMap<u32, (BasicBlock<'static>, BasicBlock<'static>)>,
+fn build_cfg<'ctx>(
+    ctx: &'ctx Context,
+    insn_blocks: &mut BTreeMap<u32, BasicBlock<'ctx>>,
+    insn_targets: &mut BTreeMap<u32, (BasicBlock<'ctx>, BasicBlock<'ctx>)>,
     prog: &[u8],
-    ctx: &'static Context,
-    function: FunctionValue<'static>,
+    function: FunctionValue<'ctx>,
     label_cnt: AtomicUsize,
 ) -> Result<(), Error> {
     let mut insn_ptr: usize = 0;
@@ -1277,9 +1276,9 @@ fn build_cfg(
             | ebpf::EXIT
             | ebpf::TAIL_CALL => {
                 prepare_jump_blocks(
+                    ctx,
                     insn_blocks,
                     insn_targets,
-                    ctx,
                     insn_ptr,
                     &insn,
                     function,
@@ -1295,13 +1294,13 @@ fn build_cfg(
     Ok(())
 }
 
-fn prepare_jump_blocks(
-    insn_blocks: &mut BTreeMap<u32, BasicBlock<'static>>,
-    insn_targets: &mut BTreeMap<u32, (BasicBlock<'static>, BasicBlock<'static>)>,
-    ctx: &'static Context,
+fn prepare_jump_blocks<'ctx>(
+    ctx: &'ctx Context,
+    insn_blocks: &mut BTreeMap<u32, BasicBlock<'ctx>>,
+    insn_targets: &mut BTreeMap<u32, (BasicBlock<'ctx>, BasicBlock<'ctx>)>,
     insn_ptr: usize,
     insn: &Insn,
-    function: FunctionValue<'static>,
+    function: FunctionValue<'ctx>,
     label_cnt: &AtomicUsize,
 ) {
     let insn_ptr = insn_ptr as u32;
@@ -1322,4 +1321,12 @@ fn prepare_jump_blocks(
 
     // Mark the blocks for this instruction
     insn_targets.insert(insn_ptr, (fallthrough_block, target_block));
+}
+
+#[test]
+fn t1() {
+    let ctx = Context::create();
+    let bc = std::fs::read("/tmp/a.bc").unwrap();
+    let membuf = MemoryBuffer::create_from_memory_range(&bc, "t");
+    let m = Module::parse_bitcode_from_buffer(&membuf, &ctx).unwrap();
 }

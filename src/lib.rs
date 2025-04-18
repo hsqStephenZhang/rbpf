@@ -168,7 +168,7 @@ pub struct EbpfVmMbuff<'a> {
     #[cfg(feature = "cranelift")]
     cranelift_prog: Option<cranelift::CraneliftProgram>,
     #[cfg(feature = "llvm")]
-    llvm_prog: Option<llvm::LLVMProgram>,
+    llvm_prog: Option<Vec<u8>>,
     helpers: HashMap<u32, ebpf::Helper>,
     allowed_memory: HashSet<u64>,
 }
@@ -617,11 +617,18 @@ impl<'a> EbpfVmMbuff<'a> {
     }
 
     #[cfg(feature = "llvm")]
-    pub fn execute_program_llvm(&self, mem: &mut [u8], mbuff: &'a mut [u8]) -> Result<u64, Error> {
+    pub fn execute_program_llvm(
+        &self,
+        ctx: &inkwell::context::Context,
+        mem: &mut [u8],
+        mbuff: &'a mut [u8],
+    ) -> Result<u64, Error> {
         // If packet data is empty, do not send the address of an empty slice; send a null pointer
         //  as first argument instead, as this is uBPF's behavior (empty packet should not happen
         //  in the kernel; anyway the verifier would prevent the use of uninitialized registers).
         //  See `mul_loop` test.
+
+        use inkwell::{memory_buffer::MemoryBuffer, module::Module};
         let mem_ptr = match mem.len() {
             0 => ptr::null_mut(),
             _ => mem.as_ptr() as *mut u8,
@@ -631,13 +638,23 @@ impl<'a> EbpfVmMbuff<'a> {
         // need to indicate to the JIT at which offset in the mbuff mem_ptr and mem_ptr + mem.len()
         // should be stored; this is what happens with struct EbpfVmFixedMbuff.
         match &self.llvm_prog {
-            Some(prog) => Ok(prog.execute(
-                &self.helpers,
-                mem_ptr,
-                mem.len() as _,
-                mbuff.as_ptr() as *mut u8,
-                mbuff.len() as _,
-            )),
+            Some(bc) => {
+                let membuf = MemoryBuffer::create_from_memory_range(&bc, "ebpf");
+                let module = Module::parse_bitcode_from_buffer(&membuf, ctx).unwrap();
+
+                let ee = module
+                    .create_jit_execution_engine(inkwell::OptimizationLevel::None)
+                    .unwrap();
+                let func = ee.get_function_address("main").unwrap();
+                let func: extern "C" fn(*const u8, u64, *const u8, u64) -> u64 =
+                    unsafe { std::mem::transmute(func) };
+                Ok(func(
+                    mem_ptr,
+                    mem.len() as _,
+                    mbuff.as_ptr() as *mut u8,
+                    mbuff.len() as _,
+                ))
+            }
             None => Err(Error::new(
                 ErrorKind::Other,
                 "Error: program has not been compiled with llvm",
@@ -1582,8 +1599,8 @@ impl<'a> EbpfVmRaw<'a> {
     }
 
     #[cfg(feature = "llvm")]
-    pub fn llvm_compile(&mut self) -> Result<(), Error> {
-        let mut program = llvm::LLVMProgram::new(self.parent.helpers.clone());
+    pub fn llvm_compile(&mut self, ctx: &inkwell::context::Context) -> Result<(), Error> {
+        let mut program = llvm::LLVMCompiler::new(self.parent.helpers.clone(), ctx);
         let prog = match self.parent.prog {
             Some(prog) => prog,
             None => Err(Error::new(
@@ -1592,22 +1609,23 @@ impl<'a> EbpfVmRaw<'a> {
             ))?,
         };
 
-        program.compile_function(prog)?;
+        let llvm_bytecode = program.compile_function(prog)?;
 
-        self.parent.llvm_prog = Some(program);
+        self.parent.llvm_prog = Some(llvm_bytecode);
         Ok(())
     }
 
     #[cfg(feature = "llvm")]
-    pub fn execute_program_llvm(&self, mem: &'a mut [u8]) -> Result<u64, Error> {
-        let mut mbuff = vec![];
-        self.parent.execute_program_llvm(mem, &mut mbuff)
+    pub fn compile_and_execute_program_llvm(&mut self, mem: &mut [u8]) -> Result<u64, Error> {
+        let context = inkwell::context::Context::create();
+        self.llvm_compile(&context)?;
+        self.parent.execute_program_llvm(&context, mem, &mut vec![])
     }
 
     #[cfg(feature = "llvm")]
     pub fn llvm_print_ir(&self) {
         if let Some(prog) = &self.parent.llvm_prog {
-            prog.print_ir();
+            // prog.print_ir();
         }
     }
 }
@@ -1674,6 +1692,10 @@ impl<'a> EbpfVmNoData<'a> {
     pub fn new(prog: Option<&'a [u8]>) -> Result<EbpfVmNoData<'a>, Error> {
         let parent = EbpfVmRaw::new(prog)?;
         Ok(EbpfVmNoData { parent })
+    }
+
+    pub fn compile_and_execute_program_llvm(&mut self) -> Result<u64, Error> {
+        self.parent.compile_and_execute_program_llvm(&mut [])
     }
 
     /// Load a new eBPF program into the virtual machine instance.
@@ -1924,11 +1946,6 @@ impl<'a> EbpfVmNoData<'a> {
         self.parent.cranelift_compile()
     }
 
-    #[cfg(feature = "llvm")]
-    pub fn llvm_compile(&mut self) -> Result<(), Error> {
-        self.parent.llvm_compile()
-    }
-
     /// Execute the previously JIT-compiled program, without providing pointers to any memory area
     /// whatsoever, in a manner very similar to `execute_program()`.
     ///
@@ -1951,11 +1968,6 @@ impl<'a> EbpfVmNoData<'a> {
     #[cfg(feature = "cranelift")]
     pub fn execute_program_cranelift(&self) -> Result<u64, Error> {
         self.parent.execute_program_cranelift(&mut [])
-    }
-
-    #[cfg(feature = "llvm")]
-    pub fn execute_program_llvm(&self) -> Result<u64, Error> {
-        self.parent.execute_program_llvm(&mut [])
     }
 
     #[cfg(feature = "llvm")]

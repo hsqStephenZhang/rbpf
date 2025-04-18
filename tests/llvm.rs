@@ -15,8 +15,8 @@ macro_rules! test_llvm {
         fn $name() {
             let prog = assemble($prog).unwrap();
             let mut vm = rbpf::EbpfVmNoData::new(Some(&prog)).unwrap();
-            vm.llvm_compile().unwrap();
-            let res = vm.execute_program_llvm().unwrap();
+            let context = inkwell::context::Context::create();
+            let res = vm.compile_and_execute_program_llvm().unwrap();
             if res != $expected {
                 vm.llvm_print_ir();
             }
@@ -29,8 +29,7 @@ macro_rules! test_llvm {
             let prog = assemble($prog).unwrap();
             let mem = &mut $mem;
             let mut vm = rbpf::EbpfVmRaw::new(Some(&prog)).unwrap();
-            vm.llvm_compile().unwrap();
-            let res = vm.execute_program_llvm(mem).unwrap();
+            let res = vm.compile_and_execute_program_llvm(mem).unwrap();
             if res != $expected {
                 println!("test case({:?}) failed, llvm ir:", stringify!($name));
                 vm.llvm_print_ir();
@@ -280,14 +279,14 @@ fn test_llvm_call() {
 
     let mut vm = rbpf::EbpfVmNoData::new(Some(&prog)).unwrap();
     vm.register_helper(0, helpers::gather_bytes).unwrap();
-    vm.llvm_compile().unwrap();
-    assert_eq!(vm.execute_program_llvm().unwrap(), 0x0102030405);
+    assert_eq!(vm.compile_and_execute_program_llvm().unwrap(), 0x0102030405);
 }
 
 #[test]
 #[should_panic(expected = "[LLVM] Error: unknown helper function (id: 0x3f)")]
 fn test_llvm_err_call_unreg() {
-    let prog = assemble("
+    let prog = assemble(
+        "
          mov r1, 1
          mov r2, 2
          mov r3, 3
@@ -295,9 +294,11 @@ fn test_llvm_err_call_unreg() {
          mov r5, 5
          call 63
          exit
-    ").unwrap();
+    ",
+    )
+    .unwrap();
     let mut vm = rbpf::EbpfVmNoData::new(Some(&prog)).unwrap();
-    vm.llvm_compile().unwrap();
+    vm.compile_and_execute_program_llvm().unwrap();
 }
 
 #[test]
@@ -317,8 +318,10 @@ fn test_llvm_call_memfrob() {
     let mut vm = rbpf::EbpfVmRaw::new(Some(&prog)).unwrap();
     vm.register_helper(1, helpers::memfrob).unwrap();
     let mem = &mut [0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08];
-    vm.llvm_compile().unwrap();
-    assert_eq!(vm.execute_program_llvm(mem).unwrap(), 0x102292e2f2c0708);
+    assert_eq!(
+        vm.compile_and_execute_program_llvm(mem).unwrap(),
+        0x102292e2f2c0708
+    );
 }
 
 test_llvm!(
@@ -480,8 +483,7 @@ fn test_llvm_err_stack_out_of_bound() {
         0x00,
     ];
     let mut vm = rbpf::EbpfVmNoData::new(Some(&prog)).unwrap();
-    vm.llvm_compile().unwrap();
-    vm.execute_program_llvm().unwrap();
+    vm.compile_and_execute_program_llvm().unwrap();
 }
 
 test_llvm!(
@@ -499,7 +501,6 @@ test_llvm!(
     ",
     0xcd
 );
-
 
 #[test]
 fn test_llvm_stack2() {
@@ -529,9 +530,7 @@ fn test_llvm_stack2() {
     let mut vm = rbpf::EbpfVmNoData::new(Some(&prog)).unwrap();
     vm.register_helper(0, helpers::gather_bytes).unwrap();
     vm.register_helper(1, helpers::memfrob).unwrap();
-    vm.llvm_compile().unwrap();
-    vm.llvm_print_ir();
-    assert_eq!(vm.execute_program_llvm().unwrap(), 0x01020304);
+    assert_eq!(vm.compile_and_execute_program_llvm().unwrap(), 0x01020304);
 }
 
 test_llvm!(
@@ -1858,8 +1857,7 @@ fn test_llvm_string_stack() {
 
     let mut vm = rbpf::EbpfVmNoData::new(Some(&prog)).unwrap();
     vm.register_helper(4, helpers::strcmp).unwrap();
-    vm.llvm_compile().unwrap();
-    assert_eq!(vm.execute_program_llvm().unwrap(), 0x0);
+    assert_eq!(vm.compile_and_execute_program_llvm().unwrap(), 0x0);
 }
 
 test_llvm!(
@@ -2049,8 +2047,7 @@ fn test_llvm_tcp_port80_match() {
     ];
     let prog = &PROG_TCP_PORT_80;
     let mut vm = rbpf::EbpfVmRaw::new(Some(prog)).unwrap();
-    vm.llvm_compile().unwrap();
-    assert_eq!(vm.execute_program_llvm(mem).unwrap(), 0x1);
+    assert_eq!(vm.compile_and_execute_program_llvm(mem).unwrap(), 0x1);
 }
 
 #[test]
@@ -2066,8 +2063,7 @@ fn test_llvm_tcp_port80_nomatch() {
     ];
     let prog = &PROG_TCP_PORT_80;
     let mut vm = rbpf::EbpfVmRaw::new(Some(prog)).unwrap();
-    vm.llvm_compile().unwrap();
-    assert_eq!(vm.execute_program_llvm(mem).unwrap(), 0x0);
+    assert_eq!(vm.compile_and_execute_program_llvm(mem).unwrap(), 0x0);
 }
 
 #[test]
@@ -2083,8 +2079,7 @@ fn test_llvm_tcp_port80_nomatch_ethertype() {
     ];
     let prog = &PROG_TCP_PORT_80;
     let mut vm = rbpf::EbpfVmRaw::new(Some(prog)).unwrap();
-    vm.llvm_compile().unwrap();
-    assert_eq!(vm.execute_program_llvm(mem).unwrap(), 0x0);
+    assert_eq!(vm.compile_and_execute_program_llvm(mem).unwrap(), 0x0);
 }
 
 #[test]
@@ -2100,8 +2095,7 @@ fn test_llvm_tcp_port80_nomatch_proto() {
     ];
     let prog = &PROG_TCP_PORT_80;
     let mut vm = rbpf::EbpfVmRaw::new(Some(prog)).unwrap();
-    vm.llvm_compile().unwrap();
-    assert_eq!(vm.execute_program_llvm(mem).unwrap(), 0x0);
+    assert_eq!(vm.compile_and_execute_program_llvm(mem).unwrap(), 0x0);
 }
 
 #[test]
@@ -2109,8 +2103,7 @@ fn test_llvm_tcp_sack_match() {
     let mut mem = TCP_SACK_MATCH.to_vec();
     let prog = assemble(TCP_SACK_ASM).unwrap();
     let mut vm = rbpf::EbpfVmRaw::new(Some(&prog)).unwrap();
-    vm.llvm_compile().unwrap();
-    assert_eq!(vm.execute_program_llvm(mem.as_mut_slice()).unwrap(), 0x1);
+    assert_eq!(vm.compile_and_execute_program_llvm(mem.as_mut_slice()).unwrap(), 0x1);
 }
 
 #[test]
@@ -2118,6 +2111,5 @@ fn test_llvm_tcp_sack_nomatch() {
     let mut mem = TCP_SACK_NOMATCH.to_vec();
     let prog = assemble(TCP_SACK_ASM).unwrap();
     let mut vm = rbpf::EbpfVmRaw::new(Some(&prog)).unwrap();
-    vm.llvm_compile().unwrap();
-    assert_eq!(vm.execute_program_llvm(mem.as_mut_slice()).unwrap(), 0x0);
+    assert_eq!(vm.compile_and_execute_program_llvm(mem.as_mut_slice()).unwrap(), 0x0);
 }
