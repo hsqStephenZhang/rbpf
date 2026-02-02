@@ -2615,6 +2615,50 @@ fn test_jit_le64() {
 }
 
 #[test]
+fn test_jit_le16_high_bits() {
+    // Test that LE16 truncates high bits
+    let prog = assemble(
+        "
+        lddw r0, 0xabcd123456781122
+        le16 r0
+        exit
+        ",
+    )
+    .unwrap();
+    let mut vm = rbpf::EbpfVmNoData::new(Some(&prog)).unwrap();
+    #[cfg(not(feature = "std"))]
+    let mut exec_mem = alloc_exec_memory();
+    #[cfg(not(feature = "std"))]
+    vm.set_jit_exec_memory(&mut exec_mem).unwrap();
+    vm.jit_compile().unwrap();
+    unsafe {
+        assert_eq!(vm.execute_program_jit().unwrap(), 0x1122);
+    }
+}
+
+#[test]
+fn test_jit_le32_high_bits() {
+    // Test that LE32 truncates high bits
+    let prog = assemble(
+        "
+        lddw r0, 0xabcd123456789abc
+        le32 r0
+        exit
+        ",
+    )
+    .unwrap();
+    let mut vm = rbpf::EbpfVmNoData::new(Some(&prog)).unwrap();
+    #[cfg(not(feature = "std"))]
+    let mut exec_mem = alloc_exec_memory();
+    #[cfg(not(feature = "std"))]
+    vm.set_jit_exec_memory(&mut exec_mem).unwrap();
+    vm.jit_compile().unwrap();
+    unsafe {
+        assert_eq!(vm.execute_program_jit().unwrap(), 0x56789abc);
+    }
+}
+
+#[test]
 fn test_jit_lsh_reg() {
     let prog = assemble(
         "

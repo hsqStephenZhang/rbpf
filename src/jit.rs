@@ -7,9 +7,9 @@
 
 #![allow(clippy::single_match)]
 
-use crate::{ebpf, format, vec, Error, HashMap, Vec};
 #[cfg(not(feature = "std"))]
 use crate::ErrorKind;
+use crate::{Error, HashMap, Vec, ebpf, format, vec};
 use core::fmt::Error as FormatterError;
 use core::fmt::Formatter;
 use core::mem;
@@ -676,7 +676,18 @@ impl JitCompiler {
                     self.emit_mov(mem, src, RCX);
                     self.emit_alu32(mem, 0xd3, 7, dst);
                 }
-                ebpf::LE         => {}, // No-op
+                ebpf::LE         => {
+                    // x64 is little-endian, but we need to truncate to the specified size
+                    match insn.imm {
+                        16 => self.emit_alu32_imm32(mem, 0x81, 4, dst, 0xffff),     // AND dst, 0xffff
+                        32 => {
+                            self.emit_alu32(mem, 0x81, 4, dst); // AND dst, 0xffffffff
+                            self.emit4(mem, 0xffffffff)
+                        },
+                        64 => {}, // No-op for 64-bit
+                        _ => unreachable!(), // Should have been caught by verifier
+                    }
+                },
                 ebpf::BE         => {
                     match insn.imm {
                         16 => {
