@@ -2344,6 +2344,39 @@ fn test_vm_neg() {
 }
 
 #[test]
+fn test_vm_neg64_overflow() {
+    // Test NEG64 with i64::MIN which wraps to itself
+    let prog = assemble(
+        "
+        mov r0, 1
+        lsh r0, 63
+        neg r0
+        exit
+        ",
+    )
+    .unwrap();
+    let vm = rbpf::EbpfVmNoData::new(Some(&prog)).unwrap();
+    assert_eq!(vm.execute_program().unwrap(), 0x8000000000000000);
+}
+
+#[test]
+fn test_vm_lsh64_large_shift() {
+    // Test LSH64 with shift >= 64 should wrap (shift & 0x3f)
+    let prog = assemble(
+        "
+        mov r0, 1
+        mov r1, 65
+        lsh r0, r1
+        exit
+        ",
+    )
+    .unwrap();
+    let vm = rbpf::EbpfVmNoData::new(Some(&prog)).unwrap();
+    // 65 & 0x3f = 1, so should shift left by 1
+    assert_eq!(vm.execute_program().unwrap(), 0x2);
+}
+
+#[test]
 fn test_vm_prime() {
     let prog = assemble(
         "

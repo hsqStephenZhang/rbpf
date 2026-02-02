@@ -326,11 +326,11 @@ pub fn execute_program(
             ebpf::OR64_REG   => reg[_dst] |=  reg[_src],
             ebpf::AND64_IMM  => reg[_dst] &=  insn.imm as u64,
             ebpf::AND64_REG  => reg[_dst] &=  reg[_src],
-            ebpf::LSH64_IMM  => reg[_dst] <<= insn.imm as u64 & SHIFT_MASK_64,
-            ebpf::LSH64_REG  => reg[_dst] <<= reg[_src] & SHIFT_MASK_64,
-            ebpf::RSH64_IMM  => reg[_dst] >>= insn.imm as u64 & SHIFT_MASK_64,
-            ebpf::RSH64_REG  => reg[_dst] >>= reg[_src] & SHIFT_MASK_64,
-            ebpf::NEG64      => reg[_dst] = -(reg[_dst] as i64) as u64,
+            ebpf::LSH64_IMM  => reg[_dst] = reg[_dst].wrapping_shl((insn.imm as u64 & SHIFT_MASK_64) as u32),
+            ebpf::LSH64_REG  => reg[_dst] = reg[_dst].wrapping_shl((reg[_src] & SHIFT_MASK_64) as u32),
+            ebpf::RSH64_IMM  => reg[_dst] = reg[_dst].wrapping_shr((insn.imm as u64 & SHIFT_MASK_64) as u32),
+            ebpf::RSH64_REG  => reg[_dst] = reg[_dst].wrapping_shr((reg[_src] & SHIFT_MASK_64) as u32),
+            ebpf::NEG64      => reg[_dst] = (reg[_dst] as i64).wrapping_neg() as u64,
             ebpf::MOD64_IMM if insn.imm == 0 => (),
             ebpf::MOD64_IMM  => reg[_dst] %=  insn.imm as u64,
             ebpf::MOD64_REG if reg[_src] == 0 => (),
@@ -339,8 +339,8 @@ pub fn execute_program(
             ebpf::XOR64_REG  => reg[_dst] ^= reg[_src],
             ebpf::MOV64_IMM  => reg[_dst] =  insn.imm  as u64,
             ebpf::MOV64_REG  => reg[_dst] =  reg[_src],
-            ebpf::ARSH64_IMM => reg[_dst] = (reg[_dst] as i64 >> (insn.imm as u64 & SHIFT_MASK_64))  as u64,
-            ebpf::ARSH64_REG => reg[_dst] = (reg[_dst] as i64 >> (reg[_src] as u64 & SHIFT_MASK_64)) as u64,
+            ebpf::ARSH64_IMM => reg[_dst] = (reg[_dst] as i64).wrapping_shr((insn.imm as u64 & SHIFT_MASK_64) as u32)  as u64,
+            ebpf::ARSH64_REG => reg[_dst] = (reg[_dst] as i64).wrapping_shr((reg[_src] as u64 & SHIFT_MASK_64) as u32) as u64,
 
             // BPF_JMP class
             // TODO: check this actually works as expected for signed / unsigned ops
